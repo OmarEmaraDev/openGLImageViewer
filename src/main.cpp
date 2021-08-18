@@ -16,6 +16,25 @@
 #define STBI_ONLY_PNG
 #include "stb_image.h"
 
+const char *IMAGE_PROCESSOR_COMPUTE_SHADER = R"(
+
+#version 330
+#extension GL_ARB_compute_shader: enable
+#extension GL_ARB_shader_image_load_store: enable
+#extension GL_ARB_shader_image_size: enable
+layout (local_size_x = 16, local_size_y = 16) in;
+layout (rgba32f) readonly uniform image2D inputImage;
+layout (rgba32f) writeonly uniform image2D outputImage;
+
+void main()
+{
+  ivec2 size = imageSize(inputImage);
+  ivec2 texel = ivec2(gl_GlobalInvocationID.xy);
+  imageStore(outputImage, texel, imageLoad(inputImage, texel));
+}
+
+)";
+
 const char *IMAGE_VIEWER_VERTEX_SHADER = R"(
 
 #version 330 core
@@ -44,14 +63,39 @@ void main()
 
 )";
 
+typedef struct ImageTexture {
+  GLuint id;
+  int width;
+  int height;
+  int channelsCount;
+
+  int getBufferSize() { return width * height * channelsCount; }
+} ImageTexture;
+
+static void verifyShader(GLuint shader) {
+  GLint status;
+  glGetShaderiv(shader, GL_COMPILE_STATUS, &status);
+  if (status == GL_TRUE) {
+    return;
+  }
+
+  GLchar log[1024];
+  GLsizei length = 0;
+  glGetShaderInfoLog(shader, sizeof(log), &length, log);
+  puts(log);
+  exit(1);
+}
+
 static GLuint createImageViewerProgram() {
   GLuint vertexShader = glCreateShader(GL_VERTEX_SHADER);
   glShaderSource(vertexShader, 1, &IMAGE_VIEWER_VERTEX_SHADER, NULL);
   glCompileShader(vertexShader);
+  verifyShader(vertexShader);
 
   GLuint fragmentShader = glCreateShader(GL_FRAGMENT_SHADER);
   glShaderSource(fragmentShader, 1, &IMAGE_VIEWER_FRAGMENT_SHADER, NULL);
   glCompileShader(fragmentShader);
+  verifyShader(fragmentShader);
 
   GLuint program = glCreateProgram();
 
@@ -68,63 +112,96 @@ static GLuint createImageViewerProgram() {
   return program;
 }
 
-static void bindImageProgram(GLuint imageViewerProgram) {
-  glUseProgram(imageViewerProgram);
-  GLint imageTextureLocation =
-      glGetUniformLocation(imageViewerProgram, "imageTexture");
-  glUniform1i(imageTextureLocation, 0);
+static GLuint createImageProcessorProgram() {
+  GLuint computeShader = glCreateShader(GL_COMPUTE_SHADER);
+  glShaderSource(computeShader, 1, &IMAGE_PROCESSOR_COMPUTE_SHADER, NULL);
+  glCompileShader(computeShader);
+  verifyShader(computeShader);
+
+  GLuint program = glCreateProgram();
+
+  glAttachShader(program, computeShader);
+
+  glLinkProgram(program);
+
+  glDeleteShader(computeShader);
+
+  return program;
 }
 
-typedef struct ImageBuffer {
-  GLuint buffer;
-  int width;
-  int height;
-  int channelsCount;
-
-  int getBufferSize() { return width * height * channelsCount; }
-} ImageBuffer;
-
-static ImageBuffer loadImageBuffer(const char *imagePath) {
-  ImageBuffer imageBuffer;
-  imageBuffer.channelsCount = 4;
+static ImageTexture loadImageTexture(const char *imagePath) {
+  ImageTexture imageTexture;
+  imageTexture.channelsCount = 4;
 
   stbi_set_flip_vertically_on_load(true);
   stbi_ldr_to_hdr_gamma(1.0f);
 
   int channelsCount;
   float *imageData =
-      stbi_loadf(imagePath, &imageBuffer.width, &imageBuffer.height,
+      stbi_loadf(imagePath, &imageTexture.width, &imageTexture.height,
                  &channelsCount, STBI_rgb_alpha);
 
-  glGenBuffers(1, &imageBuffer.buffer);
-  glBindBuffer(GL_SHADER_STORAGE_BUFFER, imageBuffer.buffer);
-  glBufferData(GL_SHADER_STORAGE_BUFFER,
-               imageBuffer.getBufferSize() * sizeof(float), imageData,
-               GL_STREAM_COPY);
-  glBindBuffer(GL_SHADER_STORAGE_BUFFER, 0);
-
-  stbi_image_free(imageData);
-
-  return imageBuffer;
-}
-
-static void drawImage(GLuint imageViewerProgram, ImageBuffer imageBuffer,
-                      int displayWidth, int displayHeight) {
-  bindImageProgram(imageViewerProgram);
-  GLuint texture;
-  glGenTextures(1, &texture);
-  glActiveTexture(GL_TEXTURE0);
-  glBindTexture(GL_TEXTURE_2D, texture);
-  glBindBuffer(GL_PIXEL_UNPACK_BUFFER, imageBuffer.buffer);
-  glTexStorage2D(GL_TEXTURE_2D, 1, GL_RGBA32F, imageBuffer.width,
-                 imageBuffer.height);
-  glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, imageBuffer.width, imageBuffer.height,
-                  GL_RGBA, GL_FLOAT, 0);
+  glGenTextures(1, &imageTexture.id);
+  glBindTexture(GL_TEXTURE_2D, imageTexture.id);
   glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
   glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
   glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
   glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
-  glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
+  glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA32F, imageTexture.width,
+               imageTexture.height, 0, GL_RGBA, GL_FLOAT, imageData);
+  glBindTexture(GL_TEXTURE_2D, 0);
+
+  stbi_image_free(imageData);
+
+  return imageTexture;
+}
+
+static ImageTexture allocateOutputTexture(ImageTexture &inputImageTexture) {
+  ImageTexture imageTexture = inputImageTexture;
+  glGenTextures(1, &imageTexture.id);
+  glBindTexture(GL_TEXTURE_2D, imageTexture.id);
+  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+  glTexStorage2D(GL_TEXTURE_2D, 1, GL_RGBA32F, imageTexture.width,
+                 imageTexture.height);
+  glBindTexture(GL_TEXTURE_2D, 0);
+  return imageTexture;
+}
+
+static void computeImage(GLuint program, ImageTexture &inputImageTexture,
+                         ImageTexture &outputImageTexture) {
+  glUseProgram(program);
+
+  GLuint inputImageUnit = 0;
+  glBindImageTexture(inputImageUnit, inputImageTexture.id, 0, GL_FALSE, 0,
+                     GL_READ_ONLY, GL_RGBA32F);
+  GLint inputImageLocation = glGetUniformLocation(program, "inputImage");
+  glUniform1i(inputImageLocation, inputImageUnit);
+
+  GLuint outputImageUnit = 1;
+  glBindImageTexture(outputImageUnit, outputImageTexture.id, 0, GL_FALSE, 0,
+                     GL_WRITE_ONLY, GL_RGBA32F);
+  GLint outputImageLocation = glGetUniformLocation(program, "outputImage");
+  glUniform1i(outputImageLocation, outputImageUnit);
+
+  glDispatchCompute(inputImageTexture.width / 16 + 1,
+                    inputImageTexture.height / 16 + 1, 1);
+  glMemoryBarrier(GL_SHADER_IMAGE_ACCESS_BARRIER_BIT);
+
+  glUseProgram(0);
+  glBindTexture(GL_TEXTURE_2D, 0);
+}
+
+static void drawImage(GLuint program, ImageTexture &imageTexture,
+                      int displayWidth, int displayHeight) {
+  glUseProgram(program);
+
+  glActiveTexture(GL_TEXTURE0);
+  glBindTexture(GL_TEXTURE_2D, imageTexture.id);
+  GLint imageTextureLocation = glGetUniformLocation(program, "imageTexture");
+  glUniform1i(imageTextureLocation, 0);
 
   GLuint vertexBuffer;
   glGenBuffers(1, &vertexBuffer);
@@ -132,8 +209,8 @@ static void drawImage(GLuint imageViewerProgram, ImageBuffer imageBuffer,
   glBufferData(GL_ARRAY_BUFFER, 16 * sizeof(float), NULL, GL_STREAM_DRAW);
   float *bufferPointer = (float *)glMapBuffer(GL_ARRAY_BUFFER, GL_WRITE_ONLY);
 
-  float normalizedWidth = (float)imageBuffer.width / displayWidth;
-  float normalizedHeight = (float)imageBuffer.height / displayHeight;
+  float normalizedWidth = (float)imageTexture.width / displayWidth;
+  float normalizedHeight = (float)imageTexture.height / displayHeight;
 
   bufferPointer[0] = 0.0f;
   bufferPointer[1] = 0.0f;
@@ -162,9 +239,8 @@ static void drawImage(GLuint imageViewerProgram, ImageBuffer imageBuffer,
   glBindVertexArray(vertexArrayObject);
 
   GLuint textureCoordinatesAttribute =
-      glGetAttribLocation(imageViewerProgram, "inTextureCoordinates");
-  GLuint positionAttribute =
-      glGetAttribLocation(imageViewerProgram, "position");
+      glGetAttribLocation(program, "inTextureCoordinates");
+  GLuint positionAttribute = glGetAttribLocation(program, "position");
 
   glEnableVertexAttribArray(textureCoordinatesAttribute);
   glEnableVertexAttribArray(positionAttribute);
@@ -210,8 +286,10 @@ int main(int argc, char **argv) {
   ImGui_ImplGlfw_InitForOpenGL(window, true);
   ImGui_ImplOpenGL3_Init("#version 330 core");
 
-  ImageBuffer inputImageBuffer = loadImageBuffer(argv[1]);
+  ImageTexture inputImageTexture = loadImageTexture(argv[1]);
+  ImageTexture outputImageTexture = allocateOutputTexture(inputImageTexture);
   GLuint imageViewerProgram = createImageViewerProgram();
+  GLuint imageProcessorProgram = createImageProcessorProgram();
 
   while (!glfwWindowShouldClose(window)) {
     glfwWaitEvents();
@@ -227,7 +305,9 @@ int main(int argc, char **argv) {
     glClearColor(0.05f, 0.05f, 0.05f, 1.0f);
     glClear(GL_COLOR_BUFFER_BIT);
 
-    drawImage(imageViewerProgram, inputImageBuffer, displayWidth,
+    computeImage(imageProcessorProgram, inputImageTexture, outputImageTexture);
+
+    drawImage(imageViewerProgram, outputImageTexture, displayWidth,
               displayHeight);
 
     static float value = 0.0f;
@@ -243,8 +323,10 @@ int main(int argc, char **argv) {
     glfwSwapBuffers(window);
   }
 
-  glDeleteBuffers(1, &inputImageBuffer.buffer);
+  glDeleteBuffers(1, &inputImageTexture.id);
+  glDeleteBuffers(1, &outputImageTexture.id);
   glDeleteProgram(imageViewerProgram);
+  glDeleteProgram(imageProcessorProgram);
 
   ImGui_ImplOpenGL3_Shutdown();
   ImGui_ImplGlfw_Shutdown();
