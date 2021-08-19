@@ -25,12 +25,13 @@ const char *IMAGE_PROCESSOR_COMPUTE_SHADER = R"(
 layout (local_size_x = 16, local_size_y = 16) in;
 layout (rgba32f) readonly uniform image2D inputImage;
 layout (rgba32f) writeonly uniform image2D outputImage;
+uniform float value;
 
 void main()
 {
   ivec2 size = imageSize(inputImage);
   ivec2 texel = ivec2(gl_GlobalInvocationID.xy);
-  imageStore(outputImage, texel, imageLoad(inputImage, texel));
+  imageStore(outputImage, texel, imageLoad(inputImage, texel) * value);
 }
 
 )";
@@ -170,6 +171,13 @@ static ImageTexture allocateOutputTexture(ImageTexture &inputImageTexture) {
   return imageTexture;
 }
 
+static void setComputeUniforms(GLuint program) {
+  static float value = 1.0f;
+  ImGui::SliderFloat("Value", &value, 0.0f, 1.0f);
+  GLint valueLocation = glGetUniformLocation(program, "value");
+  glUniform1f(valueLocation, value);
+}
+
 static void computeImage(GLuint program, ImageTexture &inputImageTexture,
                          ImageTexture &outputImageTexture) {
   glUseProgram(program);
@@ -185,6 +193,8 @@ static void computeImage(GLuint program, ImageTexture &inputImageTexture,
                      GL_WRITE_ONLY, GL_RGBA32F);
   GLint outputImageLocation = glGetUniformLocation(program, "outputImage");
   glUniform1i(outputImageLocation, outputImageUnit);
+
+  setComputeUniforms(program);
 
   glDispatchCompute(inputImageTexture.width / 16 + 1,
                     inputImageTexture.height / 16 + 1, 1);
@@ -305,16 +315,12 @@ int main(int argc, char **argv) {
     glClearColor(0.05f, 0.05f, 0.05f, 1.0f);
     glClear(GL_COLOR_BUFFER_BIT);
 
+    ImGui::Begin("OpenGL Image Viewer");
+
     computeImage(imageProcessorProgram, inputImageTexture, outputImageTexture);
 
     drawImage(imageViewerProgram, outputImageTexture, displayWidth,
               displayHeight);
-
-    static float value = 0.0f;
-
-    ImGui::Begin("OpenGL Image Viewer");
-
-    ImGui::SliderFloat("Value", &value, 0.0f, 1.0f);
 
     ImGui::End();
 
